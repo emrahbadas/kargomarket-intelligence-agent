@@ -2,6 +2,7 @@ import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { env } from '../config/env.js';
 import { AppConfigStore } from './appConfigStore.js';
+import { TelegramSourceStore } from './telegramSourceStore.js';
 
 interface ResolvedChannel {
   entity: unknown;
@@ -22,6 +23,7 @@ interface ReaderStatus {
   connected: boolean;
   hasSession: boolean;
   sourceChannels: string[];
+  sourceChannelSource: 'none' | 'env' | 'supabase' | 'memory';
   sessionSource: 'none' | 'env' | 'supabase' | 'memory';
   sessionPreview: string | null;
   persistence: {
@@ -104,6 +106,7 @@ export class TelegramReader {
   private client: InternalTelegramClient | null = null;
   private authClient: InternalTelegramClient | null = null;
   private readonly appConfigStore = new AppConfigStore();
+  private readonly telegramSourceStore = new TelegramSourceStore();
   private apiId: number | null = env.TELEGRAM_API_ID ? Number(env.TELEGRAM_API_ID) : null;
   private apiHash: string | null = env.TELEGRAM_API_HASH || null;
   private sessionString: string = env.TELEGRAM_SESSION_STRING || '';
@@ -112,6 +115,7 @@ export class TelegramReader {
   private lastPhoneNumber: string | null = env.TELEGRAM_PHONE_NUMBER || null;
   private connected = false;
   private authConnected = false;
+  private sourceChannelSource: 'none' | 'env' | 'supabase' | 'memory' = this.sourceChannels.length ? 'env' : 'none';
   private sessionSource: 'none' | 'env' | 'supabase' | 'memory' = this.sessionString ? 'env' : 'none';
   private lastPersistedAt: string | null = null;
   private lastPersistenceError: string | null = null;
@@ -170,14 +174,46 @@ export class TelegramReader {
   }
 
   async initialize() {
-    const storedSession = await this.loadPersistedSession();
-    if (!storedSession) {
-      return this.getStatus();
+    const [storedSession] = await Promise.all([
+      this.loadPersistedSession(),
+      this.loadTrackedChannels(),
+    ]);
+
+    if (storedSession) {
+      this.resetClient();
+      this.resetAuthClient();
     }
 
-    this.resetClient();
-    this.resetAuthClient();
     return this.getStatus();
+  }
+
+  private async loadTrackedChannels() {
+    if (!this.telegramSourceStore.isConfigured()) {
+      return false;
+    }
+
+    try {
+      const channelRefs = await this.telegramSourceStore.listEnabledChannelRefs();
+      if (!channelRefs.length) {
+        return false;
+      }
+
+      this.sourceChannels = uniqueStrings(channelRefs);
+      this.sourceChannelSource = 'supabase';
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async syncTrackedChannels() {
+    if (!this.telegramSourceStore.isConfigured()) {
+      return false;
+    }
+
+    await this.telegramSourceStore.syncChannelRefs(this.sourceChannels);
+    this.sourceChannelSource = this.sourceChannels.length ? 'supabase' : 'none';
+    return true;
   }
 
   private async loadPersistedSession() {
@@ -251,7 +287,7 @@ export class TelegramReader {
     }
   }
 
-  configure(input: ConfigureReaderInput) {
+  async configure(input: ConfigureReaderInput) {
     if (input.apiId !== undefined) {
       const parsed = Number(input.apiId);
       if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -277,6 +313,8 @@ export class TelegramReader {
 
     if (Array.isArray(input.sourceChannels)) {
       this.sourceChannels = uniqueStrings(input.sourceChannels);
+      this.sourceChannelSource = this.sourceChannels.length ? 'memory' : 'none';
+      await this.syncTrackedChannels();
     }
 
     this.resetClient();
@@ -294,6 +332,7 @@ export class TelegramReader {
       connected: this.connected,
       hasSession,
       sourceChannels: [...this.sourceChannels],
+      sourceChannelSource: this.sourceChannels.length ? this.sourceChannelSource : 'none',
       sessionSource: hasSession ? this.sessionSource : 'none',
       sessionPreview: hasSession ? maskSessionString(this.sessionString) : null,
       persistence: {
@@ -587,6 +626,7 @@ export class TelegramReader {
 
   setTrackedChannels(channels: string[]) {
     this.sourceChannels = uniqueStrings(channels);
+    this.sourceChannelSource = this.sourceChannels.length ? 'memory' : 'none';
     return this.getTrackedChannels();
   }
 

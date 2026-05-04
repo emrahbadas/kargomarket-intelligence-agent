@@ -9,6 +9,8 @@ Bu servis su an icin asagidaki gorevleri ustlenir:
 - deterministik parser ile ilk kategori / confidence uretir
 - model anahtarlari eklendiginde OpenAI-uyumlu servisler uzerinden ozetleme / siniflandirma yapabilir
 - Telegram kullanici hesabi (MTProto) ile okunmus kanal icerigini ingest akisina tasiyabilir
+- Telegram session string bilgisini Supabase `app_config` uzerinde kalici tutabilir
+- Telegram kanal listesini Supabase `telegram_sources` tablosundan yukleyebilir
 - backoffice uygulamasi icin review queue endpoint sozlesmesini sabitler
 
 Bu servis bilerek sinirli tutulmustur:
@@ -27,15 +29,49 @@ Bu servis bilerek sinirli tutulmustur:
 - review queue listeleme ve durum guncelleme endpoint'i
 - health ve dependency health endpoint'leri
 
+## Mevcut calisma modeli
+
+- servis Railway uzerinde calisir; kullanicinin PC'sinin acik olmasi gerekmez
+- Telegram session bilgisi deploy sonrasi Supabase `app_config(key='telegram_session_string')` uzerinden geri yuklenir
+- Telegram kanal listesi varsa Supabase `telegram_sources` tablosindan yuklenir; yoksa env fallback'i kullanilir
+- servis su an agirlikli olarak istek geldikce calisan bir HTTP API'dir
+- su an repoda scheduler, cron, worker dongusu veya otomatik ingestion cycle yoktur
+- bu nedenle bugunku yapida servis barinir ama kendi kendine periyodik veri toplama henuz yapmaz
+
 ## Telegram notu
 
 Kanal okuma mantigi Bot API degil, kullanici hesabi + MTProto olarak modellenmistir. Bu nedenle `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, telefon dogrulama ve session string akisi beklenir.
 
 GramJS istemcisi bu repoda servis katmanina eklenmistir. Telegram route'lari `AGENT_API_TOKEN` tanimliysa yetki basligi olmadan 401 doner.
 
-## Sonraki adim
+Session persistence akisi artik lokal `.env` dosyasina yazma mantigina bagli degildir. Basarili OTP / 2FA sonrasi session string Supabase `app_config` tablosuna upsert edilir ve servis acilisinda oradan yuklenir.
 
-`kargomarket-backoffice` bu servisin review queue endpoint'lerini tuketerek preview / approve / reject / publish akislarini yonetecek.
+Telegram kanal konfigrasyonu icin hedef veri gercegi `telegram_sources` tablosudur. `POST /v1/telegram/configure` icinde `sourceChannels` verilirse servis bu listeyi tabloya senkronlamaya calisir; tablo bos veya erisilemez durumdaysa env fallback'i korunur.
+
+## Mimari yol haritasi
+
+Siralama su sekilde tutulmalidir:
+
+1. Supabase tablolarini tamamla.
+2. Agent icine tek bir `run ingestion cycle` orchestrator isi ekle.
+3. Railway scheduler veya esdegeri ile bu isi zamanli tetikle.
+4. Hosted admin / backoffice ekranini ekle.
+
+Bu siralamada lokal admin dashboard ilk oncelik degildir. Once veri kaynaklari, kanal listesi, job durumu ve kalici is akisinin Supabase tarafinda modellenmesi gerekir.
+
+Hedef durum:
+
+- kanal listesi env yerine Supabase tablosundan okunur
+- agent otomatik ingestion cycle'i Railway uzerinde kullanicidan bagimsiz calistirir
+- admin panel operasyon, reauth, kanal yonetimi ve job izlemesi icin kullanilir
+- OTP yeniden girilmesi gerekirse bu islem hosted admin panelden tetiklenir
+
+## Supabase tablolari
+
+- `app_config`: Telegram session string gibi kucuk servis konfigrasyonlari
+- `telegram_sources`: izlenecek kanal referanslari, enable durumu ve oncelik sirasi
+- `agent_ingestion_runs`: scheduler / manual ingestion calismalarinin durum kaydi
+- `telegram_channel_cursors`: kanal bazli son islenen mesaj referansi
 
 ## Gelistirme
 
@@ -55,10 +91,12 @@ Varsayilan port: `3001`
 - `POST /v1/ingest/manual`
 - `POST /v1/review-queue/:id/status`
 - `GET /v1/telegram/status`
+- `GET /v1/telegram/session`
 - `POST /v1/telegram/configure`
 - `POST /v1/telegram/send-code`
 - `POST /v1/telegram/verify-code`
 - `POST /v1/telegram/verify-2fa`
+- `POST /v1/telegram/persist-session`
 - `GET /v1/telegram/channels`
 - `POST /v1/telegram/read-messages`
 - `POST /v1/telegram/search`
@@ -69,6 +107,8 @@ Varsayilan port: `3001`
 - `send-code`: telefon numarasina kod gonder
 - `verify-code`: kodu dogrula
 - `verify-2fa`: 2FA aciksa sifreyi dogrula
+- `session`: aktif session bilgisini goster
+- `persist-session`: aktif session bilgisini Supabase `app_config` icine yaz
 - `channels` / `read-messages` / `search`: kanal verilerini listele/oku/ara
 
 ## Hedef entegrasyon
@@ -76,3 +116,4 @@ Varsayilan port: `3001`
 - public uygulama: sadece `published` katmani okur
 - intelligence agent: `raw` ve `review` katmanini doldurur
 - backoffice: `review` akisini yonetir ve `publish` kararini verir
+- gelecekte scheduler / worker katmani agent'i kullanicidan bagimsiz tam otomasyona tasir

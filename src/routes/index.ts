@@ -177,7 +177,7 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
     }
 
     try {
-      const status = telegramReader.configure(parsedBody.data);
+      const status = await telegramReader.configure(parsedBody.data);
       return reply.send({ status: 'ok', data: status });
     } catch (error) {
       return reply.code(400).send({ status: 'error', error: toErrorMessage(error) });
