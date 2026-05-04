@@ -132,8 +132,12 @@ Bu komut `partial` veya `failed` durumda non-zero exit code ile cikar. Bu sayede
 
 Railway tarafinda iki pratik kullanim sekli vardir:
 
-- ayni env'leri tasiyan ayri bir cron/worker komutunda `npm run ingest:once`
+- ayni repo kaynak kodunu kullanan iki ayri Railway service kurmak:
+	- web service: Start Command `npm start`, Healthcheck Path `/health`
+	- cron service: Start Command `npm run ingest:once`, healthcheck kapali, Cron Schedule `*/30 * * * *`
 - harici scheduler kullaniliyorsa token korumali `POST /v1/ingestion/run` cagrisini tetiklemek
+
+Not: `railway.json` icinde `startCommand` ve `healthcheckPath` bilincli olarak kilitli tutulmuyor. Boylece web ve cron service ayarlari Railway panelinde birbirinden bagimsiz verilebilir.
 
 HTTP tetikleme ornegi:
 
