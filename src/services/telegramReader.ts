@@ -1,6 +1,7 @@
 import { Api, TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { env } from '../config/env.js';
+import { AppConfigStore } from './appConfigStore.js';
 
 interface ResolvedChannel {
   entity: unknown;
@@ -21,6 +22,23 @@ interface ReaderStatus {
   connected: boolean;
   hasSession: boolean;
   sourceChannels: string[];
+  sessionSource: 'none' | 'env' | 'supabase' | 'memory';
+  sessionPreview: string | null;
+  persistence: {
+    configured: boolean;
+    target: 'supabase.app_config' | 'memory';
+    key: string | null;
+    lastPersistedAt: string | null;
+    lastError: string | null;
+  };
+}
+
+interface SessionPersistenceResult {
+  persisted: boolean;
+  target: 'supabase.app_config' | 'memory';
+  key: string | null;
+  updatedAt: string | null;
+  error?: string;
 }
 
 type InternalTelegramClient = TelegramClient & {
@@ -67,8 +85,25 @@ const uniqueStrings = (items: string[]) => {
   return [...new Set(items.map((item) => String(item || '').trim()).filter(Boolean))];
 };
 
+const TELEGRAM_SESSION_CONFIG_KEY = 'telegram_session_string';
+
+const maskSessionString = (value: string) => {
+  const safeValue = String(value || '').trim();
+  if (!safeValue) {
+    return null;
+  }
+
+  if (safeValue.length <= 14) {
+    return `${safeValue.slice(0, 4)}...${safeValue.slice(-4)}`;
+  }
+
+  return `${safeValue.slice(0, 8)}...${safeValue.slice(-8)}`;
+};
+
 export class TelegramReader {
   private client: InternalTelegramClient | null = null;
+  private authClient: InternalTelegramClient | null = null;
+  private readonly appConfigStore = new AppConfigStore();
   private apiId: number | null = env.TELEGRAM_API_ID ? Number(env.TELEGRAM_API_ID) : null;
   private apiHash: string | null = env.TELEGRAM_API_HASH || null;
   private sessionString: string = env.TELEGRAM_SESSION_STRING || '';
@@ -76,6 +111,10 @@ export class TelegramReader {
   private phoneCodeHash: string | null = null;
   private lastPhoneNumber: string | null = env.TELEGRAM_PHONE_NUMBER || null;
   private connected = false;
+  private authConnected = false;
+  private sessionSource: 'none' | 'env' | 'supabase' | 'memory' = this.sessionString ? 'env' : 'none';
+  private lastPersistedAt: string | null = null;
+  private lastPersistenceError: string | null = null;
 
   private ensureConfigured() {
     if (!this.apiId || !this.apiHash) {
@@ -83,11 +122,11 @@ export class TelegramReader {
     }
   }
 
-  private createClient() {
+  private createClient(sessionString = this.sessionString) {
     this.ensureConfigured();
 
     return new TelegramClient(
-      new StringSession(this.sessionString || ''),
+      new StringSession(sessionString || ''),
       this.apiId as number,
       this.apiHash as string,
       {
@@ -109,13 +148,107 @@ export class TelegramReader {
     this.connected = false;
   }
 
-  async disconnect() {
-    if (!this.client || !this.connected) {
-      return;
+  private resetAuthClient() {
+    if (this.authClient) {
+      void this.authClient.disconnect().catch(() => undefined);
     }
 
-    await this.client.disconnect();
-    this.connected = false;
+    this.authClient = null;
+    this.authConnected = false;
+  }
+
+  async disconnect() {
+    if (this.client && this.connected) {
+      await this.client.disconnect();
+      this.connected = false;
+    }
+
+    if (this.authClient && this.authConnected) {
+      await this.authClient.disconnect();
+      this.authConnected = false;
+    }
+  }
+
+  async initialize() {
+    const storedSession = await this.loadPersistedSession();
+    if (!storedSession) {
+      return this.getStatus();
+    }
+
+    this.resetClient();
+    this.resetAuthClient();
+    return this.getStatus();
+  }
+
+  private async loadPersistedSession() {
+    if (!this.appConfigStore.isConfigured()) {
+      return false;
+    }
+
+    try {
+      const entry = await this.appConfigStore.getValue(TELEGRAM_SESSION_CONFIG_KEY);
+      if (!entry?.value || entry.value.length < 10) {
+        return false;
+      }
+
+      this.sessionString = entry.value;
+      this.sessionSource = 'supabase';
+      this.lastPersistedAt = entry.updatedAt;
+      this.lastPersistenceError = null;
+      return true;
+    } catch (error) {
+      this.lastPersistenceError = formatError(error);
+      return false;
+    }
+  }
+
+  private async persistSession(): Promise<SessionPersistenceResult> {
+    const sessionString = this.getSessionString();
+    if (!sessionString || sessionString.length < 10) {
+      return {
+        persisted: false,
+        target: this.appConfigStore.isConfigured() ? 'supabase.app_config' : 'memory',
+        key: this.appConfigStore.isConfigured() ? TELEGRAM_SESSION_CONFIG_KEY : null,
+        updatedAt: null,
+        error: 'Gecerli Telegram session bulunamadi.',
+      };
+    }
+
+    if (!this.appConfigStore.isConfigured()) {
+      this.sessionSource = 'memory';
+      this.lastPersistenceError = 'Supabase app_config persistence not configured.';
+      return {
+        persisted: false,
+        target: 'memory',
+        key: null,
+        updatedAt: null,
+        error: this.lastPersistenceError,
+      };
+    }
+
+    try {
+      const entry = await this.appConfigStore.setValue(TELEGRAM_SESSION_CONFIG_KEY, sessionString);
+      this.sessionSource = 'supabase';
+      this.lastPersistedAt = entry.updatedAt;
+      this.lastPersistenceError = null;
+
+      return {
+        persisted: true,
+        target: 'supabase.app_config',
+        key: entry.key,
+        updatedAt: entry.updatedAt,
+      };
+    } catch (error) {
+      this.sessionSource = 'memory';
+      this.lastPersistenceError = formatError(error);
+      return {
+        persisted: false,
+        target: 'supabase.app_config',
+        key: TELEGRAM_SESSION_CONFIG_KEY,
+        updatedAt: null,
+        error: this.lastPersistenceError,
+      };
+    }
   }
 
   configure(input: ConfigureReaderInput) {
@@ -139,6 +272,7 @@ export class TelegramReader {
 
     if (input.sessionString !== undefined) {
       this.sessionString = String(input.sessionString || '');
+      this.sessionSource = this.sessionString ? 'memory' : 'none';
     }
 
     if (Array.isArray(input.sourceChannels)) {
@@ -146,6 +280,7 @@ export class TelegramReader {
     }
 
     this.resetClient();
+    this.resetAuthClient();
     return this.getStatus();
   }
 
@@ -159,10 +294,26 @@ export class TelegramReader {
       connected: this.connected,
       hasSession,
       sourceChannels: [...this.sourceChannels],
+      sessionSource: hasSession ? this.sessionSource : 'none',
+      sessionPreview: hasSession ? maskSessionString(this.sessionString) : null,
+      persistence: {
+        configured: this.appConfigStore.isConfigured(),
+        target: this.appConfigStore.isConfigured() ? 'supabase.app_config' : 'memory',
+        key: this.appConfigStore.isConfigured() ? TELEGRAM_SESSION_CONFIG_KEY : null,
+        lastPersistedAt: this.lastPersistedAt,
+        lastError: this.lastPersistenceError,
+      },
     };
   }
 
   getSessionString() {
+    if (this.authClient) {
+      const latestAuth = String((this.authClient.session as unknown as StringSession).save() || '');
+      if (latestAuth) {
+        this.sessionString = latestAuth;
+      }
+    }
+
     if (this.client) {
       const latest = String((this.client.session as unknown as StringSession).save() || '');
       if (latest) {
@@ -171,6 +322,20 @@ export class TelegramReader {
     }
 
     return this.sessionString;
+  }
+
+  getSessionInfo() {
+    const sessionString = this.getSessionString();
+    return {
+      sessionString,
+      sessionPreview: maskSessionString(sessionString),
+      sessionSource: sessionString ? this.sessionSource : 'none',
+      persistence: this.getStatus().persistence,
+    };
+  }
+
+  async persistCurrentSession() {
+    return this.persistSession();
   }
 
   async connect() {
@@ -183,6 +348,19 @@ export class TelegramReader {
     if (!this.connected) {
       await this.client.connect();
       this.connected = true;
+    }
+  }
+
+  private async connectAuthClient() {
+    this.ensureConfigured();
+
+    if (!this.authClient) {
+      this.authClient = this.createClient('');
+    }
+
+    if (!this.authConnected) {
+      await this.authClient.connect();
+      this.authConnected = true;
     }
   }
 
@@ -277,13 +455,14 @@ export class TelegramReader {
       throw new Error('Telefon numarasi gerekli.');
     }
 
-    await this.connect();
+    this.resetAuthClient();
+    await this.connectAuthClient();
 
-    if (!this.client) {
+    if (!this.authClient) {
       throw new Error('Telegram client olusturulamadi.');
     }
 
-    const result = await this.client.sendCode(
+    const result = await this.authClient.sendCode(
       {
         apiId: this.apiId as number,
         apiHash: this.apiHash as string,
@@ -305,9 +484,9 @@ export class TelegramReader {
   }
 
   async verifyCode(code: string, phoneNumber?: string, phoneCodeHash?: string) {
-    await this.connect();
+    await this.connectAuthClient();
 
-    if (!this.client) {
+    if (!this.authClient) {
       throw new Error('Telegram client olusturulamadi.');
     }
 
@@ -328,7 +507,7 @@ export class TelegramReader {
     }
 
     try {
-      await this.client.invoke(
+      await this.authClient.invoke(
         new Api.auth.SignIn({
           phoneNumber: phone,
           phoneCodeHash: hash,
@@ -347,20 +526,25 @@ export class TelegramReader {
       throw new Error(message);
     }
 
-    this.sessionString = String((this.client.session as unknown as StringSession).save() || '');
+    this.sessionString = String((this.authClient.session as unknown as StringSession).save() || '');
+    this.sessionSource = 'memory';
     this.phoneCodeHash = null;
+    const persistence = await this.persistSession();
+    this.resetClient();
+    this.resetAuthClient();
 
     return {
       status: 'ok' as const,
       message: 'Telegram girisi basarili.',
       sessionString: this.sessionString,
+      persistence,
     };
   }
 
   async verify2FA(password?: string) {
-    await this.connect();
+    await this.connectAuthClient();
 
-    if (!this.client) {
+    if (!this.authClient) {
       throw new Error('Telegram client olusturulamadi.');
     }
 
@@ -369,25 +553,30 @@ export class TelegramReader {
       throw new Error('2FA sifresi gerekli.');
     }
 
-    const passwordInfo = await this.client.invoke(new Api.account.GetPassword());
-    const computed = await (this.client._computeCheck?.(passwordInfo, effectivePassword));
+    const passwordInfo = await this.authClient.invoke(new Api.account.GetPassword());
+    const computed = await (this.authClient._computeCheck?.(passwordInfo, effectivePassword));
 
     if (!computed) {
       throw new Error('2FA sifresi dogrulanamadi.');
     }
 
-    await this.client.invoke(
+    await this.authClient.invoke(
       new Api.auth.CheckPassword({
         password: computed as unknown as Api.TypeInputCheckPasswordSRP,
       }),
     );
 
-    this.sessionString = String((this.client.session as unknown as StringSession).save() || '');
+    this.sessionString = String((this.authClient.session as unknown as StringSession).save() || '');
+    this.sessionSource = 'memory';
+    const persistence = await this.persistSession();
+    this.resetClient();
+    this.resetAuthClient();
 
     return {
       status: 'ok' as const,
       message: '2FA dogrulamasi basarili.',
       sessionString: this.sessionString,
+      persistence,
     };
   }
 

@@ -14,6 +14,8 @@ const start = async () => {
   const pipeline = new PipelineService();
   const telegramReader = new TelegramReader();
 
+  await telegramReader.initialize();
+
   app.addHook('onClose', async () => {
     await telegramReader.disconnect();
   });

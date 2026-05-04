@@ -1,6 +1,4 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { reviewStatusValues } from '../domain/types.js';
@@ -55,22 +53,6 @@ const telegramSearchSchema = z.object({
 const telegramChannelQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(500).optional(),
 });
-
-const persistSessionToEnv = (sessionString: string) => {
-  const envPath = resolve(process.cwd(), '.env');
-  const line = `TELEGRAM_SESSION_STRING=${sessionString}`;
-  const current = readFileSync(envPath, 'utf8');
-
-  let updated = '';
-  if (/^TELEGRAM_SESSION_STRING=.*$/m.test(current)) {
-    updated = current.replace(/^TELEGRAM_SESSION_STRING=.*$/m, line);
-  } else {
-    updated = `${current.trimEnd()}\n${line}\n`;
-  }
-
-  writeFileSync(envPath, updated, 'utf8');
-  return envPath;
-};
 
 const toErrorMessage = (error: unknown) => {
   if (error && typeof error === 'object') {
@@ -277,26 +259,38 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
       return reply;
     }
 
-    const sessionString = telegramReader.getSessionString();
-    if (!sessionString || sessionString.length < 10) {
+    const session = telegramReader.getSessionInfo();
+    if (!session.sessionString || session.sessionString.length < 10) {
       return reply.code(400).send({
         status: 'error',
         error: 'Kalici kayit icin gecerli Telegram session bulunamadi.',
       });
     }
 
-    try {
-      const envPath = persistSessionToEnv(sessionString);
-      return reply.send({
-        status: 'ok',
-        data: {
-          persisted: true,
-          envPath,
-        },
-      });
-    } catch (error) {
-      return reply.code(500).send({ status: 'error', error: toErrorMessage(error) });
+    const result = await telegramReader.persistCurrentSession();
+    return reply.send({
+      status: result.persisted ? 'ok' : 'warning',
+      data: {
+        ...result,
+        sessionPreview: session.sessionPreview,
+      },
+    });
+  });
+
+  app.get('/v1/telegram/session', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
     }
+
+    const session = telegramReader.getSessionInfo();
+    if (!session.sessionString || session.sessionString.length < 10) {
+      return reply.code(404).send({
+        status: 'error',
+        error: 'Aktif Telegram session bulunamadi.',
+      });
+    }
+
+    return reply.send({ status: 'ok', data: session });
   });
 
   app.get('/v1/telegram/channels', async (request, reply) => {
