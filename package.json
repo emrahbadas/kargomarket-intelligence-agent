@@ -10,6 +10,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "ingest:once": "node dist/scripts/runTelegramIngestionCycle.js",
+    "ingest:once:dev": "tsx src/scripts/runTelegramIngestionCycle.ts",
     "check": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

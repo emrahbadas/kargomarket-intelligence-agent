@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { reviewStatusValues } from '../domain/types.js';
+import { IngestionOrchestrator } from '../services/ingestionOrchestrator.js';
 import { PipelineService } from '../services/pipeline.js';
 import { TelegramReader } from '../services/telegramReader.js';
 
@@ -54,6 +55,12 @@ const telegramChannelQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(500).optional(),
 });
 
+const ingestionRunSchema = z.object({
+  channelRefs: z.array(z.string().min(1)).optional(),
+  limitPerChannel: z.number().int().positive().max(100).optional(),
+  triggerSource: z.string().min(2).max(50).optional(),
+});
+
 const toErrorMessage = (error: unknown) => {
   if (error && typeof error === 'object') {
     const maybeError = error as { message?: string; errorMessage?: string };
@@ -78,11 +85,13 @@ const ensureWriteAccess = async (request: FastifyRequest, reply: FastifyReply) =
 };
 
 export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineService, telegramReader: TelegramReader) => {
+  const ingestionOrchestrator = new IngestionOrchestrator(pipeline, telegramReader);
+
   app.get('/health', async () => ({
     service: 'kargomarket-intelligence-agent',
     status: 'ok',
     timestamp: new Date().toISOString(),
-    stats: pipeline.getStats(),
+    stats: await pipeline.getStats(),
   }));
 
   app.get('/health/dependencies', async () => {
@@ -106,7 +115,7 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
   }));
 
   app.get('/v1/review-queue', async () => ({
-    items: pipeline.listReviewQueue(),
+    items: await pipeline.listReviewQueue(),
   }));
 
   app.post('/v1/ingest/manual', async (request, reply) => {
@@ -124,6 +133,28 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
 
     const created = await pipeline.submitManualIngest(parsedBody.data);
     return reply.code(201).send(created);
+  });
+
+  app.post('/v1/ingestion/run', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
+    }
+
+    const parsedBody = ingestionRunSchema.safeParse(request.body || {});
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        error: 'Invalid payload',
+        details: parsedBody.error.flatten(),
+      });
+    }
+
+    try {
+      const result = await ingestionOrchestrator.runTelegramCycle(parsedBody.data);
+      const statusCode = result.status === 'failed' ? 500 : 200;
+      return reply.code(statusCode).send({ status: result.status, data: result });
+    } catch (error) {
+      return reply.code(500).send({ status: 'error', error: toErrorMessage(error) });
+    }
   });
 
   app.post('/v1/review-queue/:id/status', async (request, reply) => {
@@ -144,7 +175,7 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
       });
     }
 
-    const updated = pipeline.updateReviewStatus(params.data.id, body.data.status, body.data.reviewerNotes);
+    const updated = await pipeline.updateReviewStatus(params.data.id, body.data.status, body.data.reviewerNotes);
     if (!updated) {
       return reply.code(404).send({ error: 'Review item not found' });
     }

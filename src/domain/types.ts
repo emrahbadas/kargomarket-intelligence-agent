@@ -95,8 +95,10 @@ export interface DependencyHealth {
 }
 
 export interface ManualIngestInput {
+  sourceId?: string;
   sourceName: string;
   title: string;
   rawText: string;
   sourceUrl?: string;
+  publishedAt?: string;
 }

@@ -4,6 +4,7 @@ import type { DependencyHealth, ManualIngestInput, ParsedSignal, PublishTarget, 
 import { InMemoryStore } from './inMemoryStore.js';
 import { ModelRouter } from './aiRouter.js';
 import { getSourceCatalog } from './sourceCatalog.js';
+import { SupabasePipelineStore } from './supabasePipelineStore.js';
 
 const resolvePublishTarget = (category: ParsedSignal['category']): PublishTarget => {
   if (category === 'fuel' || category === 'route' || category === 'supply-demand') {
@@ -16,6 +17,7 @@ const resolvePublishTarget = (category: ParsedSignal['category']): PublishTarget
 export class PipelineService {
   constructor(
     private readonly store = new InMemoryStore(),
+    private readonly supabaseStore = new SupabasePipelineStore(),
     private readonly modelRouter = new ModelRouter(),
     private readonly sources: SourceRecord[] = getSourceCatalog(),
   ) {}
@@ -24,7 +26,11 @@ export class PipelineService {
     return this.sources;
   }
 
-  listReviewQueue() {
+  async listReviewQueue() {
+    if (this.supabaseStore.isConfigured()) {
+      return this.supabaseStore.listReviews();
+    }
+
     return this.store.listReviews();
   }
 
@@ -44,7 +50,11 @@ export class PipelineService {
     };
   }
 
-  getStats() {
+  async getStats() {
+    if (this.supabaseStore.isConfigured()) {
+      return this.supabaseStore.getStats();
+    }
+
     return this.store.stats();
   }
 
@@ -57,17 +67,21 @@ export class PipelineService {
 
     const rawItem: RawIngestItem = {
       id: randomUUID(),
-      sourceId,
+      sourceId: input.sourceId || sourceId,
       sourceName: input.sourceName,
       title: input.title.trim(),
       rawText: input.rawText.trim(),
       sourceUrl: input.sourceUrl,
-      publishedAt: now,
+      publishedAt: input.publishedAt || now,
       checksum,
       createdAt: now,
     };
 
-    this.store.saveRaw(rawItem);
+    if (this.supabaseStore.isConfigured()) {
+      await this.supabaseStore.saveRaw(rawItem);
+    } else {
+      this.store.saveRaw(rawItem);
+    }
 
     const normalized = await this.modelRouter.summarize(rawItem);
 
@@ -83,7 +97,11 @@ export class PipelineService {
       createdAt: now,
     };
 
-    this.store.saveParsed(parsedItem);
+    if (this.supabaseStore.isConfigured()) {
+      await this.supabaseStore.saveParsed(parsedItem);
+    } else {
+      this.store.saveParsed(parsedItem);
+    }
 
     const reviewItem: ReviewQueueItem = {
       id: randomUUID(),
@@ -102,7 +120,11 @@ export class PipelineService {
       updatedAt: now,
     };
 
-    this.store.saveReview(reviewItem);
+    if (this.supabaseStore.isConfigured()) {
+      await this.supabaseStore.saveReview(reviewItem);
+    } else {
+      this.store.saveReview(reviewItem);
+    }
 
     return {
       rawItem,
@@ -111,7 +133,11 @@ export class PipelineService {
     };
   }
 
-  updateReviewStatus(id: string, status: ReviewStatus, reviewerNotes?: string) {
+  async updateReviewStatus(id: string, status: ReviewStatus, reviewerNotes?: string) {
+    if (this.supabaseStore.isConfigured()) {
+      return this.supabaseStore.updateReviewStatus(id, status, reviewerNotes);
+    }
+
     return this.store.updateReviewStatus(id, status, reviewerNotes);
   }
 }
