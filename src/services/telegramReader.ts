@@ -311,6 +311,7 @@ export class TelegramReader {
       const latestAuth = String((this.authClient.session as unknown as StringSession).save() || '');
       if (latestAuth) {
         this.sessionString = latestAuth;
+        return this.sessionString;
       }
     }
 
