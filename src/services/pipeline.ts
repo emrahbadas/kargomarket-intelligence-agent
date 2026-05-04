@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { env } from '../config/env.js';
-import type { DependencyHealth, ManualIngestInput, ParsedSignal, PublishTarget, RawIngestItem, ReviewQueueItem, ReviewStatus, SourceRecord } from '../domain/types.js';
+import type { DependencyHealth, ManualIngestInput, ParsedSignal, PublishTarget, PublishedContentItem, RawIngestItem, ReviewQueueItem, ReviewStatus, SourceRecord } from '../domain/types.js';
 import { InMemoryStore } from './inMemoryStore.js';
 import { ModelRouter } from './aiRouter.js';
 import { getSourceCatalog } from './sourceCatalog.js';
@@ -32,6 +32,14 @@ export class PipelineService {
     }
 
     return this.store.listReviews();
+  }
+
+  async listPublished(target?: PublishTarget, limit = 100) {
+    if (this.supabaseStore.isConfigured()) {
+      return this.supabaseStore.listPublished(target, limit);
+    }
+
+    return this.store.listPublished(target).slice(0, limit);
   }
 
   getDependencyHealth(): DependencyHealth {
@@ -139,5 +147,97 @@ export class PipelineService {
     }
 
     return this.store.updateReviewStatus(id, status, reviewerNotes);
+  }
+
+  async publishReviewItem(id: string, reviewerNotes?: string): Promise<PublishedContentItem | null> {
+    const now = new Date().toISOString();
+
+    if (this.supabaseStore.isConfigured()) {
+      const reviewItem = await this.supabaseStore.getReviewById(id);
+      if (!reviewItem) {
+        return null;
+      }
+
+      if (reviewItem.status === 'rejected') {
+        throw new Error('Reddedilen icerik yayinlanamaz.');
+      }
+
+      if (reviewItem.status !== 'approved' && reviewItem.status !== 'published') {
+        throw new Error('Icerigi yayinlamadan once approved durumuna almalisin.');
+      }
+
+      const parsedItem = await this.supabaseStore.getParsedById(reviewItem.parsedSignalId);
+      if (!parsedItem) {
+        throw new Error('Publish icin gerekli parse sonucu bulunamadi.');
+      }
+
+      const existing = await this.supabaseStore.getPublishedByReviewId(reviewItem.id, reviewItem.publishTarget);
+      const publishedItem: PublishedContentItem = {
+        id: existing?.id || randomUUID(),
+        reviewQueueId: reviewItem.id,
+        parsedSignalId: reviewItem.parsedSignalId,
+        rawIngestId: reviewItem.rawIngestId,
+        publishTarget: reviewItem.publishTarget,
+        title: reviewItem.title,
+        summary: reviewItem.summary,
+        impactSummary: reviewItem.impactSummary,
+        category: reviewItem.category,
+        confidence: reviewItem.confidence,
+        sourceName: reviewItem.sourceName,
+        sourceUrl: reviewItem.sourceUrl,
+        facts: parsedItem.facts,
+        reviewerNotes: reviewerNotes ?? reviewItem.reviewerNotes,
+        publishedAt: existing?.publishedAt || now,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+      };
+
+      const saved = await this.supabaseStore.savePublished(publishedItem);
+      await this.supabaseStore.updateReviewStatus(id, 'published', publishedItem.reviewerNotes);
+      return saved || publishedItem;
+    }
+
+    const reviewItem = this.store.getReviewById(id);
+    if (!reviewItem) {
+      return null;
+    }
+
+    if (reviewItem.status === 'rejected') {
+      throw new Error('Reddedilen icerik yayinlanamaz.');
+    }
+
+    if (reviewItem.status !== 'approved' && reviewItem.status !== 'published') {
+      throw new Error('Icerigi yayinlamadan once approved durumuna almalisin.');
+    }
+
+    const parsedItem = this.store.getParsedById(reviewItem.parsedSignalId);
+    if (!parsedItem) {
+      throw new Error('Publish icin gerekli parse sonucu bulunamadi.');
+    }
+
+    const existing = this.store.getPublishedByReviewId(reviewItem.id);
+    const publishedItem: PublishedContentItem = {
+      id: existing?.id || randomUUID(),
+      reviewQueueId: reviewItem.id,
+      parsedSignalId: reviewItem.parsedSignalId,
+      rawIngestId: reviewItem.rawIngestId,
+      publishTarget: reviewItem.publishTarget,
+      title: reviewItem.title,
+      summary: reviewItem.summary,
+      impactSummary: reviewItem.impactSummary,
+      category: reviewItem.category,
+      confidence: reviewItem.confidence,
+      sourceName: reviewItem.sourceName,
+      sourceUrl: reviewItem.sourceUrl,
+      facts: parsedItem.facts,
+      reviewerNotes: reviewerNotes ?? reviewItem.reviewerNotes,
+      publishedAt: existing?.publishedAt || now,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    };
+
+    const saved = this.store.savePublished(publishedItem);
+    this.store.updateReviewStatus(id, 'published', publishedItem.reviewerNotes);
+    return saved;
   }
 }

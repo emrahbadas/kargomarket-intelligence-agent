@@ -86,6 +86,26 @@ export interface ReviewQueueItem {
   updatedAt: string;
 }
 
+export interface PublishedContentItem {
+  id: string;
+  reviewQueueId: string;
+  parsedSignalId: string;
+  rawIngestId: string;
+  publishTarget: PublishTarget;
+  title: string;
+  summary: string;
+  impactSummary: string;
+  category: ContentCategory;
+  confidence: number;
+  sourceName: string;
+  sourceUrl?: string;
+  facts: Record<string, string | number | boolean | null>;
+  reviewerNotes?: string;
+  publishedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DependencyHealth {
   models: 'ready' | 'disabled' | 'missing_key';
   supabase: 'configured' | 'not_configured';

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { env } from '../config/env.js';
-import { reviewStatusValues } from '../domain/types.js';
+import { publishTargetValues, reviewStatusValues } from '../domain/types.js';
 import { IngestionOrchestrator } from '../services/ingestionOrchestrator.js';
 import { PipelineService } from '../services/pipeline.js';
 import { TelegramReader } from '../services/telegramReader.js';
@@ -16,6 +16,21 @@ const manualIngestSchema = z.object({
 const reviewUpdateSchema = z.object({
   status: z.enum(reviewStatusValues),
   reviewerNotes: z.string().max(500).optional(),
+});
+
+const publishReviewSchema = z.object({
+  reviewerNotes: z.string().max(500).optional(),
+});
+
+const reviewQueueQuerySchema = z.object({
+  status: z.enum(reviewStatusValues).optional(),
+  publishTarget: z.enum(publishTargetValues).optional(),
+  limit: z.coerce.number().int().positive().max(500).optional(),
+});
+
+const publishedQuerySchema = z.object({
+  publishTarget: z.enum(publishTargetValues).optional(),
+  limit: z.coerce.number().int().positive().max(500).optional(),
 });
 
 const telegramConfigureSchema = z.object({
@@ -70,12 +85,25 @@ const toErrorMessage = (error: unknown) => {
   return String(error || 'Unknown error');
 };
 
+const readBearerToken = (value: string | string[] | undefined) => {
+  const headerValue = Array.isArray(value) ? value[0] : value;
+  if (!headerValue) {
+    return null;
+  }
+
+  const match = headerValue.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+};
+
 const ensureWriteAccess = async (request: FastifyRequest, reply: FastifyReply) => {
   if (!env.AGENT_API_TOKEN) {
     return true;
   }
 
-  const token = request.headers['x-agent-token'];
+  const rawHeaderToken = request.headers['x-agent-token'];
+  const headerToken = Array.isArray(rawHeaderToken) ? rawHeaderToken[0] : rawHeaderToken;
+  const bearerToken = readBearerToken(request.headers.authorization);
+  const token = headerToken || bearerToken;
   if (token === env.AGENT_API_TOKEN) {
     return true;
   }
@@ -114,9 +142,36 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
     items: pipeline.listSources(),
   }));
 
-  app.get('/v1/review-queue', async () => ({
-    items: await pipeline.listReviewQueue(),
-  }));
+  app.get('/v1/review-queue', async (request, reply) => {
+    const parsedQuery = reviewQueueQuerySchema.safeParse(request.query || {});
+    if (!parsedQuery.success) {
+      return reply.code(400).send({
+        error: 'Invalid query',
+        details: parsedQuery.error.flatten(),
+      });
+    }
+
+    const items = await pipeline.listReviewQueue();
+    const filtered = items
+      .filter((item) => !parsedQuery.data.status || item.status === parsedQuery.data.status)
+      .filter((item) => !parsedQuery.data.publishTarget || item.publishTarget === parsedQuery.data.publishTarget)
+      .slice(0, parsedQuery.data.limit || 200);
+
+    return { items: filtered };
+  });
+
+  app.get('/v1/published', async (request, reply) => {
+    const parsedQuery = publishedQuerySchema.safeParse(request.query || {});
+    if (!parsedQuery.success) {
+      return reply.code(400).send({
+        error: 'Invalid query',
+        details: parsedQuery.error.flatten(),
+      });
+    }
+
+    const items = await pipeline.listPublished(parsedQuery.data.publishTarget, parsedQuery.data.limit || 100);
+    return { items };
+  });
 
   app.post('/v1/ingest/manual', async (request, reply) => {
     if (!(await ensureWriteAccess(request, reply))) {
@@ -181,6 +236,36 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
     }
 
     return reply.send(updated);
+  });
+
+  app.post('/v1/review-queue/:id/publish', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
+    }
+
+    const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+    const body = publishReviewSchema.safeParse(request.body || {});
+
+    if (!params.success || !body.success) {
+      return reply.code(400).send({
+        error: 'Invalid payload',
+        details: {
+          params: params.success ? null : params.error.flatten(),
+          body: body.success ? null : body.error.flatten(),
+        },
+      });
+    }
+
+    try {
+      const published = await pipeline.publishReviewItem(params.data.id, body.data.reviewerNotes);
+      if (!published) {
+        return reply.code(404).send({ error: 'Review item not found' });
+      }
+
+      return reply.send({ status: 'ok', data: published });
+    } catch (error) {
+      return reply.code(400).send({ status: 'error', error: toErrorMessage(error) });
+    }
   });
 
   app.get('/v1/telegram/status', async (_request, reply) => {

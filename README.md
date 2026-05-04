@@ -12,6 +12,7 @@ Bu servis su an icin asagidaki gorevleri ustlenir:
 - Telegram session string bilgisini Supabase `app_config` uzerinde kalici tutabilir
 - Telegram kanal listesini Supabase `telegram_sources` tablosundan yukleyebilir
 - raw ingest, parse ve review queue kayitlarini Supabase tablolarina yazabilir
+- approved review kayitlarini `published_sector_news` veya `published_market_signals` tablosuna publish edebilir
 - backoffice uygulamasi icin review queue endpoint sozlesmesini sabitler
 
 Bu servis bilerek sinirli tutulmustur:
@@ -76,6 +77,8 @@ Hedef durum:
 - `raw_content_ingest`: ham icerik omurgasi
 - `content_parse_results`: normalize / parse sonuclari
 - `content_review_queue`: editor inceleme kuyrugu
+- `published_sector_news`: yayinlanmis sektor haberleri
+- `published_market_signals`: yayinlanmis market/sinyal icerikleri
 - `agent_ingestion_runs`: scheduler / manual ingestion calismalarinin durum kaydi
 - `telegram_channel_cursors`: kanal bazli son islenen mesaj referansi
 
@@ -94,9 +97,11 @@ Varsayilan port: `3001`
 - `GET /health/dependencies`
 - `GET /v1/sources`
 - `GET /v1/review-queue`
+- `GET /v1/published`
 - `POST /v1/ingest/manual`
 - `POST /v1/ingestion/run`
 - `POST /v1/review-queue/:id/status`
+- `POST /v1/review-queue/:id/publish`
 - `GET /v1/telegram/status`
 - `GET /v1/telegram/session`
 - `POST /v1/telegram/configure`
@@ -137,6 +142,42 @@ curl -X POST "$APP_URL/v1/ingestion/run" \
 	-H "Authorization: Bearer $AGENT_API_TOKEN" \
 	-H "Content-Type: application/json" \
 	-d '{"triggerSource":"railway-scheduler","limitPerChannel":20}'
+```
+
+## Review to publish akisi
+
+Bugunku durumda ayri bir backoffice UI henuz yok. Ama artik akisin API ve Supabase veri omurgasi hazir:
+
+1. Scheduler veya manual ingest calisir ve yeni kayit `content_review_queue` tablosuna `pending` olarak duser.
+2. Pending kayitlari `GET /v1/review-queue?status=pending` ile gorursun.
+3. Uygun buldugun kaydi once `approved` durumuna alirsin.
+4. Sonra `POST /v1/review-queue/:id/publish` ile publish edersin.
+5. `publishTarget` degerine gore kayit `published_sector_news` veya `published_market_signals` tablosuna yazilir.
+6. Yayinlanan icerigi `GET /v1/published?publishTarget=sector-news` veya Supabase tablosundan gorursun.
+
+Ornek approve:
+
+```bash
+curl -X POST "$APP_URL/v1/review-queue/$REVIEW_ID/status" \
+	-H "Authorization: Bearer $AGENT_API_TOKEN" \
+	-H "Content-Type: application/json" \
+	-d '{"status":"approved","reviewerNotes":"Yayin icin uygun."}'
+```
+
+Ornek publish:
+
+```bash
+curl -X POST "$APP_URL/v1/review-queue/$REVIEW_ID/publish" \
+	-H "Authorization: Bearer $AGENT_API_TOKEN" \
+	-H "Content-Type: application/json" \
+	-d '{"reviewerNotes":"Editor onayi verildi."}'
+```
+
+Ornek listeleme:
+
+```bash
+curl "$APP_URL/v1/review-queue?status=pending&publishTarget=sector-news"
+curl "$APP_URL/v1/published?publishTarget=sector-news"
 ```
 
 ## Telegram quick flow
