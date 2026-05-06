@@ -5,6 +5,7 @@ import { publishTargetValues, reviewStatusValues } from '../domain/types.js';
 import { IngestionOrchestrator } from '../services/ingestionOrchestrator.js';
 import { PipelineService } from '../services/pipeline.js';
 import { TelegramReader } from '../services/telegramReader.js';
+import { searchYouTubeByKeywords } from '../services/youtubeSearch.js';
 
 const manualIngestSchema = z.object({
   sourceName: z.string().min(2),
@@ -60,6 +61,12 @@ const telegramReadMessagesSchema = z.object({
   limit: z.number().int().positive().max(100).optional(),
 });
 
+const telegramScanMessagesSchema = z.object({
+  channelRefs: z.array(z.string().min(1)).min(1),
+  hoursBack: z.number().int().positive().max(24 * 30),
+  limitPerChannel: z.number().int().positive().max(250).optional(),
+});
+
 const telegramSearchSchema = z.object({
   channelRefs: z.array(z.string().min(1)).optional(),
   keywords: z.array(z.string().min(1)),
@@ -74,6 +81,13 @@ const ingestionRunSchema = z.object({
   channelRefs: z.array(z.string().min(1)).optional(),
   limitPerChannel: z.number().int().positive().max(100).optional(),
   triggerSource: z.string().min(2).max(50).optional(),
+});
+
+const youtubeSearchSchema = z.object({
+  keywords: z.array(z.string().min(2)).min(1).max(12),
+  channelFilters: z.array(z.string().min(1)).max(12).optional(),
+  limit: z.number().int().positive().max(30).optional(),
+  publishedAfterHours: z.number().int().positive().max(24 * 180).optional(),
 });
 
 const toErrorMessage = (error: unknown) => {
@@ -207,6 +221,27 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
       const result = await ingestionOrchestrator.runTelegramCycle(parsedBody.data);
       const statusCode = result.status === 'failed' ? 500 : 200;
       return reply.code(statusCode).send({ status: result.status, data: result });
+    } catch (error) {
+      return reply.code(500).send({ status: 'error', error: toErrorMessage(error) });
+    }
+  });
+
+  app.post('/v1/youtube/search', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
+    }
+
+    const parsedBody = youtubeSearchSchema.safeParse(request.body || {});
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        error: 'Invalid payload',
+        details: parsedBody.error.flatten(),
+      });
+    }
+
+    try {
+      const result = await searchYouTubeByKeywords(parsedBody.data);
+      return { status: 'ok', data: result };
     } catch (error) {
       return reply.code(500).send({ status: 'error', error: toErrorMessage(error) });
     }
@@ -370,6 +405,32 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
     }
   });
 
+  app.post('/v1/telegram/test-connection', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
+    }
+
+    try {
+      const result = await telegramReader.testConnection();
+      return reply.send({ status: 'ok', data: result });
+    } catch (error) {
+      return reply.code(400).send({ status: 'error', error: toErrorMessage(error) });
+    }
+  });
+
+  app.post('/v1/telegram/reset-session', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
+    }
+
+    try {
+      const status = await telegramReader.resetSession();
+      return reply.send({ status: 'ok', data: status });
+    } catch (error) {
+      return reply.code(400).send({ status: 'error', error: toErrorMessage(error) });
+    }
+  });
+
   app.post('/v1/telegram/persist-session', async (request, reply) => {
     if (!(await ensureWriteAccess(request, reply))) {
       return reply;
@@ -448,6 +509,43 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
       return reply.send({ status: 'ok', data: messages });
     } catch (error) {
       return reply.code(400).send({ status: 'error', error: toErrorMessage(error), data: [] });
+    }
+  });
+
+  app.post('/v1/telegram/scan-messages', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
+    }
+
+    const parsedBody = telegramScanMessagesSchema.safeParse(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        error: 'Invalid payload',
+        details: parsedBody.error.flatten(),
+      });
+    }
+
+    try {
+      const items = await telegramReader.scanRecentMessages(parsedBody.data.channelRefs, {
+        hoursBack: parsedBody.data.hoursBack,
+        limitPerChannel: parsedBody.data.limitPerChannel,
+      });
+
+      return reply.send({
+        status: 'ok',
+        data: {
+          items,
+          summary: {
+            scannedAt: new Date().toISOString(),
+            hoursBack: parsedBody.data.hoursBack,
+            channelCount: parsedBody.data.channelRefs.length,
+            itemCount: items.length,
+            limitPerChannel: parsedBody.data.limitPerChannel || 80,
+          },
+        },
+      });
+    } catch (error) {
+      return reply.code(400).send({ status: 'error', error: toErrorMessage(error), data: { items: [] } });
     }
   });
 

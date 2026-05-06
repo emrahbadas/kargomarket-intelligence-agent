@@ -17,15 +17,35 @@ interface ConfigureReaderInput {
   sourceChannels?: string[];
 }
 
+interface ScanMessagesOptions {
+  hoursBack: number;
+  limitPerChannel?: number;
+}
+
+interface ScannedChannelMessage {
+  id: number;
+  date: string | null;
+  text: string;
+  views: number;
+  forwards: number;
+  sender: string;
+  channel: string;
+  channelId: string;
+  channelRef: string;
+}
+
 interface ReaderStatus {
   configured: boolean;
   authenticated: boolean;
   connected: boolean;
   hasSession: boolean;
+  pendingCode: boolean;
   sourceChannels: string[];
   sourceChannelSource: 'none' | 'env' | 'supabase' | 'memory';
   sessionSource: 'none' | 'env' | 'supabase' | 'memory';
   sessionPreview: string | null;
+  phoneNumberConfigured: boolean;
+  phoneNumberPreview: string | null;
   persistence: {
     configured: boolean;
     target: 'supabase.app_config' | 'memory';
@@ -33,6 +53,13 @@ interface ReaderStatus {
     lastPersistedAt: string | null;
     lastError: string | null;
   };
+  liveCheck: {
+    status: 'idle' | 'ok' | 'failed';
+    checkedAt: string | null;
+    message: string | null;
+    sampleCount: number | null;
+  };
+  reason: string | null;
 }
 
 interface SessionPersistenceResult {
@@ -102,6 +129,19 @@ const maskSessionString = (value: string) => {
   return `${safeValue.slice(0, 8)}...${safeValue.slice(-8)}`;
 };
 
+const maskPhoneNumber = (value: string) => {
+  const safeValue = String(value || '').trim();
+  if (!safeValue) {
+    return null;
+  }
+
+  if (safeValue.length <= 6) {
+    return `${safeValue.slice(0, 2)}...${safeValue.slice(-2)}`;
+  }
+
+  return `${safeValue.slice(0, 5)}...${safeValue.slice(-2)}`;
+};
+
 export class TelegramReader {
   private client: InternalTelegramClient | null = null;
   private authClient: InternalTelegramClient | null = null;
@@ -119,6 +159,51 @@ export class TelegramReader {
   private sessionSource: 'none' | 'env' | 'supabase' | 'memory' = this.sessionString ? 'env' : 'none';
   private lastPersistedAt: string | null = null;
   private lastPersistenceError: string | null = null;
+  private lastAuthError: string | null = null;
+  private lastLiveCheckStatus: 'idle' | 'ok' | 'failed' = 'idle';
+  private lastLiveCheckAt: string | null = null;
+  private lastLiveCheckMessage: string | null = null;
+  private lastLiveCheckSampleCount: number | null = null;
+
+  private setLiveCheck(status: 'idle' | 'ok' | 'failed', message: string | null, sampleCount: number | null = null) {
+    this.lastLiveCheckStatus = status;
+    this.lastLiveCheckAt = new Date().toISOString();
+    this.lastLiveCheckMessage = message;
+    this.lastLiveCheckSampleCount = sampleCount;
+  }
+
+  private resetLiveCheck() {
+    this.lastLiveCheckStatus = 'idle';
+    this.lastLiveCheckAt = null;
+    this.lastLiveCheckMessage = null;
+    this.lastLiveCheckSampleCount = null;
+  }
+
+  private isSessionRevokedError(message: string) {
+    return /(SESSION_REVOKED|AUTH_KEY_UNREGISTERED|SESSION_EXPIRED)/i.test(message);
+  }
+
+  private async invalidateSession(reason: string) {
+    this.sessionString = '';
+    this.sessionSource = 'none';
+    this.phoneCodeHash = null;
+    this.lastAuthError = reason;
+    this.setLiveCheck('failed', reason, 0);
+    this.resetClient();
+    this.resetAuthClient();
+
+    if (!this.appConfigStore.isConfigured()) {
+      return;
+    }
+
+    try {
+      const entry = await this.appConfigStore.setValue(TELEGRAM_SESSION_CONFIG_KEY, '');
+      this.lastPersistedAt = entry.updatedAt;
+      this.lastPersistenceError = null;
+    } catch (error) {
+      this.lastPersistenceError = formatError(error);
+    }
+  }
 
   private ensureConfigured() {
     if (!this.apiId || !this.apiHash) {
@@ -231,6 +316,7 @@ export class TelegramReader {
       this.sessionSource = 'supabase';
       this.lastPersistedAt = entry.updatedAt;
       this.lastPersistenceError = null;
+      this.lastAuthError = null;
       return true;
     } catch (error) {
       this.lastPersistenceError = formatError(error);
@@ -309,6 +395,8 @@ export class TelegramReader {
     if (input.sessionString !== undefined) {
       this.sessionString = String(input.sessionString || '');
       this.sessionSource = this.sessionString ? 'memory' : 'none';
+      this.lastAuthError = null;
+      this.resetLiveCheck();
     }
 
     if (Array.isArray(input.sourceChannels)) {
@@ -322,19 +410,56 @@ export class TelegramReader {
     return this.getStatus();
   }
 
+  async resetSession() {
+    this.sessionString = '';
+    this.sessionSource = 'none';
+    this.phoneCodeHash = null;
+    this.lastAuthError = 'Telegram session sifirlandi. Tekrar kod isteyebilirsiniz.';
+    this.resetClient();
+    this.resetAuthClient();
+    this.setLiveCheck('idle', this.lastAuthError, null);
+
+    if (this.appConfigStore.isConfigured()) {
+      try {
+        const entry = await this.appConfigStore.setValue(TELEGRAM_SESSION_CONFIG_KEY, '');
+        this.lastPersistedAt = entry.updatedAt;
+        this.lastPersistenceError = null;
+      } catch (error) {
+        this.lastPersistenceError = formatError(error);
+      }
+    }
+
+    return this.getStatus();
+  }
+
+  async testConnection(limit = 10) {
+    const channels = await this.getJoinedChannels(limit);
+
+    return {
+      checkedAt: this.lastLiveCheckAt,
+      channelCount: channels.length,
+      sampleChannels: channels.slice(0, 5),
+      status: this.getStatus(),
+    };
+  }
+
   getStatus(): ReaderStatus {
     const configured = Boolean(this.apiId && this.apiHash);
     const hasSession = Boolean(this.sessionString && this.sessionString.length > 10);
+    const phoneNumber = String(this.lastPhoneNumber || env.TELEGRAM_PHONE_NUMBER || '').trim();
 
     return {
       configured,
       authenticated: hasSession,
       connected: this.connected,
       hasSession,
+      pendingCode: Boolean(this.phoneCodeHash),
       sourceChannels: [...this.sourceChannels],
       sourceChannelSource: this.sourceChannels.length ? this.sourceChannelSource : 'none',
       sessionSource: hasSession ? this.sessionSource : 'none',
       sessionPreview: hasSession ? maskSessionString(this.sessionString) : null,
+      phoneNumberConfigured: Boolean(phoneNumber),
+      phoneNumberPreview: maskPhoneNumber(phoneNumber),
       persistence: {
         configured: this.appConfigStore.isConfigured(),
         target: this.appConfigStore.isConfigured() ? 'supabase.app_config' : 'memory',
@@ -342,6 +467,13 @@ export class TelegramReader {
         lastPersistedAt: this.lastPersistedAt,
         lastError: this.lastPersistenceError,
       },
+      liveCheck: {
+        status: this.lastLiveCheckStatus,
+        checkedAt: this.lastLiveCheckAt,
+        message: this.lastLiveCheckMessage,
+        sampleCount: this.lastLiveCheckSampleCount,
+      },
+      reason: this.lastAuthError,
     };
   }
 
@@ -379,15 +511,28 @@ export class TelegramReader {
   }
 
   async connect() {
-    this.ensureConfigured();
+    try {
+      this.ensureConfigured();
 
-    if (!this.client) {
-      this.client = this.createClient();
-    }
+      if (!this.client) {
+        this.client = this.createClient();
+      }
 
-    if (!this.connected) {
-      await this.client.connect();
-      this.connected = true;
+      if (!this.connected) {
+        await this.client.connect();
+        this.connected = true;
+        this.lastAuthError = null;
+      }
+    } catch (error) {
+      const message = formatError(error);
+      if (this.isSessionRevokedError(message)) {
+        await this.invalidateSession('Telegram session gecersiz veya revoke edildi. Yeniden OTP ile giris yapin.');
+      } else {
+        this.lastAuthError = message;
+        this.setLiveCheck('failed', message, 0);
+      }
+
+      throw new Error(this.lastAuthError || message);
     }
   }
 
@@ -513,6 +658,7 @@ export class TelegramReader {
 
     this.lastPhoneNumber = phone;
     this.phoneCodeHash = String(result.phoneCodeHash || '');
+    this.lastAuthError = null;
     const isCodeViaApp = Boolean((result as { isCodeViaApp?: boolean }).isCodeViaApp);
 
     return {
@@ -569,6 +715,8 @@ export class TelegramReader {
     this.sessionString = String((this.authClient.session as unknown as StringSession).save() || '');
     this.sessionSource = 'memory';
     this.phoneCodeHash = null;
+    this.lastAuthError = null;
+    this.resetLiveCheck();
     const persistence = await this.persistSession();
     this.resetClient();
     this.resetAuthClient();
@@ -608,6 +756,8 @@ export class TelegramReader {
 
     this.sessionString = String((this.authClient.session as unknown as StringSession).save() || '');
     this.sessionSource = 'memory';
+    this.lastAuthError = null;
+    this.resetLiveCheck();
     const persistence = await this.persistSession();
     this.resetClient();
     this.resetAuthClient();
@@ -637,11 +787,26 @@ export class TelegramReader {
       throw new Error('Telegram client olusturulamadi.');
     }
 
-    const dialogs = await this.client.getDialogs({
-      limit: Math.max(1, Math.min(Number(limit) || 200, 500)),
-    });
+    let dialogs;
+    try {
+      dialogs = await this.client.getDialogs({
+        limit: Math.max(1, Math.min(Number(limit) || 200, 500)),
+      });
+      this.lastAuthError = null;
+      this.setLiveCheck('ok', `${dialogs.length} kanal listesi alindi.`, dialogs.length);
+    } catch (error) {
+      const message = formatError(error);
+      if (this.isSessionRevokedError(message)) {
+        await this.invalidateSession('Telegram session gecersiz veya revoke edildi. Yeniden OTP ile giris yapin.');
+      } else {
+        this.lastAuthError = message;
+        this.setLiveCheck('failed', message, 0);
+      }
 
-    return dialogs
+      throw new Error(this.lastAuthError || message);
+    }
+
+    const channels = dialogs
       .filter((dialog) => {
         const value = dialog as unknown as { isChannel?: boolean; isGroup?: boolean };
         return Boolean(value.isChannel || value.isGroup);
@@ -665,6 +830,10 @@ export class TelegramReader {
           isGroup: Boolean(value.isGroup),
         };
       });
+
+    this.setLiveCheck('ok', `${channels.length} kanal listesi alindi.`, channels.length);
+
+    return channels;
   }
 
   async readChannelMessages(channelRef: string, limit = 20) {
@@ -704,6 +873,100 @@ export class TelegramReader {
           channelId: resolved.channelId,
         };
       });
+  }
+
+  async scanRecentMessages(channelRefs: string[], options: ScanMessagesOptions) {
+    await this.connect();
+
+    if (!this.client) {
+      throw new Error('Telegram client olusturulamadi.');
+    }
+
+    const normalizedChannels = uniqueStrings(channelRefs);
+    if (!normalizedChannels.length) {
+      throw new Error('Taranacak kanal listesi bos olamaz.');
+    }
+
+    const hoursBack = Math.max(1, Math.min(Number(options.hoursBack) || 24, 24 * 30));
+    const limitPerChannel = Math.max(10, Math.min(Number(options.limitPerChannel) || 80, 250));
+    const cutoffTime = Date.now() - (hoursBack * 60 * 60 * 1000);
+    const batchSize = Math.min(50, limitPerChannel);
+    const results: ScannedChannelMessage[] = [];
+
+    for (const channelRef of normalizedChannels) {
+      const resolved = await this.resolveChannelEntity(channelRef);
+      let offsetId = 0;
+      let collectedForChannel = 0;
+      let continueScanning = true;
+
+      while (continueScanning && collectedForChannel < limitPerChannel) {
+        const remaining = limitPerChannel - collectedForChannel;
+        const messages = await this.client.getMessages(resolved.entity as never, {
+          limit: Math.min(batchSize, remaining),
+          offsetId: offsetId || undefined,
+        });
+
+        if (!messages.length) {
+          break;
+        }
+
+        let nextOffsetId = offsetId;
+
+        for (const message of messages) {
+          const value = message as unknown as {
+            id?: number;
+            date?: unknown;
+            message?: string;
+            views?: number;
+            forwards?: number;
+            fromId?: { userId?: { toString?: () => string } };
+          };
+
+          const messageId = Number(value.id || 0);
+          const messageText = String(value.message || '').trim();
+          const messageDate = toIsoDate(value.date);
+          nextOffsetId = messageId || nextOffsetId;
+
+          if (!messageId || !messageText) {
+            continue;
+          }
+
+          if (messageDate) {
+            const timestamp = new Date(messageDate).getTime();
+            if (Number.isFinite(timestamp) && timestamp < cutoffTime) {
+              continueScanning = false;
+              continue;
+            }
+          }
+
+          results.push({
+            id: messageId,
+            date: messageDate,
+            text: messageText,
+            views: Number(value.views || 0),
+            forwards: Number(value.forwards || 0),
+            sender: value.fromId?.userId?.toString?.() || 'channel',
+            channel: resolved.channelTitle,
+            channelId: resolved.channelId,
+            channelRef,
+          });
+          collectedForChannel += 1;
+
+          if (collectedForChannel >= limitPerChannel) {
+            continueScanning = false;
+            break;
+          }
+        }
+
+        if (!nextOffsetId || nextOffsetId === offsetId) {
+          break;
+        }
+
+        offsetId = nextOffsetId;
+      }
+    }
+
+    return results.sort((left, right) => String(right.date || '').localeCompare(String(left.date || '')));
   }
 
   async searchChannels(channelRefs: string[], keywords: string[], limit = 10) {
