@@ -68,6 +68,15 @@ export interface NewsSearchItem {
   articleCharCount: number;
   /** Cekilemediyse sebebi (bot engeli, cerez duvari, zaman asimi...). */
   articleFailureReason: string | null;
+  /**
+   * Cekilen makaleden onizleme kesiti.
+   *
+   * NEDEN VAR: editor tezgahta `summary` alanini goruyordu, o ise arama
+   * modelinin kendi ozeti - yani havuza giren asil malzeme DEGIL. Zengin
+   * bir makale cekilmis olsa bile kart yalin gorunuyor ve "icerik az
+   * geliyor" izlenimi veriyordu. Bu alan gercekte ne toplandigini gosterir.
+   */
+  articleExcerpt: string | null;
 }
 
 export interface NewsSearchResult {
@@ -319,6 +328,9 @@ export class NewsSearchService {
         articleFetched: Boolean(govde),
         articleCharCount: govde?.length ?? 0,
         articleFailureReason: makale?.failureReason ?? 'Cikarim denenmedi',
+        // Onizleme cumle sinirinda kesilir; kartta yarim cumle gostermek
+        // editore metnin bozuk oldugu izlenimi verir.
+        articleExcerpt: govde ? truncateAtSentence(govde, { budget: 700 }) : null,
         rawText: [
           'Acik haber kaynagi taramasi',
           `Aranan konular: ${query}`,
