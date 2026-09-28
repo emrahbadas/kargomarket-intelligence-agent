@@ -39,7 +39,10 @@ const fallbackParse = (rawItem: RawIngestItem): ParsedDraft => {
 
   const matchedRule = rules.find((rule) => rule.keywords.some((keyword) => text.includes(keyword)));
   const category = matchedRule?.category ?? 'other';
-  const summary = rawItem.rawText.trim().slice(0, 280) || rawItem.title;
+  // Model devre disiyken kullanilan yedek yol. 280 karakterlik eski sinir
+  // uzun ham metinleri de kirpiyordu; editor kuyruguna giden veri ne kadar
+  // tamsa editorun isi o kadar kolay olur.
+  const summary = rawItem.rawText.trim().slice(0, 1500) || rawItem.title;
 
   return {
     category,
@@ -96,19 +99,48 @@ export class ModelRouter {
       },
       body: JSON.stringify({
         model,
-        temperature: 0.1,
+        temperature: 0.2,
+        // Onceki surumde max_tokens yoktu ve istem uzunluk hic belirtmiyordu;
+        // model 150-280 karakterlik ozetlerle yetiniyordu. 1500 token, hedef
+        // 800-1200 karakterlik ozet + etki degerlendirmesi icin rahat sinir.
+        max_tokens: 1500,
         response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
             content: [
-              'You classify logistics intelligence items for a review queue.',
-              'Return strict JSON with keys: title, summary, impactSummary, category, confidence, facts.',
-              'Translate incoming user content to Turkish and ensure title, summary, and impactSummary are in Turkish.',
-              `category must be one of: ${contentCategoryValues.join(', ')}`,
-              'confidence must be a number between 0 and 1.',
-              'Never claim the item is verified; simply normalize it for editor review.',
-            ].join(' '),
+              'Sen bir lojistik istihbarat editorusun. Gelen ham icerigi editor kuyruguna hazirliyorsun.',
+              '',
+              'Yalnizca su anahtarlarla gecerli JSON dondur: title, summary, impactSummary, category, confidence, facts.',
+              '',
+              'DIL: title, summary ve impactSummary TURKCE olmali. Gelen icerik baska dildeyse cevir.',
+              '',
+              'UZUNLUK - bu kritik:',
+              '- summary 800-1200 karakter olmali. Bu bir tweet degil, kisa bir haber metnidir.',
+              '- Tek cumlelik ozet KABUL EDILMEZ. En az 4-6 cumle yaz.',
+              '- impactSummary 200-400 karakter olmali.',
+              '',
+              'SUMMARY NASIL YAZILIR:',
+              '- Once ne oldugunu anlat: olay, aktorler, yer, zaman.',
+              '- Sonra sayisal ayrintilari ver: fiyat, oran, tonaj, tarih, mesafe, sure. Kaynakta gecen her rakami kullan.',
+              '- Kaynakta kim ne soylemis, gorusleri ayirt edilebilir sekilde aktar.',
+              '- Belirsizlikleri acikca yaz ("kaynakta net sayi verilmiyor" gibi).',
+              '',
+              'UYDURMA YASAK: Kaynakta olmayan rakam, tarih, isim veya alinti URETME.',
+              'Kaynak yetersizse summary kisa kalabilir; bosluklari uydurarak doldurmak yerine',
+              'neyin eksik oldugunu yaz. Uzunluk hedefi, icerik varsa gecerlidir.',
+              '',
+              'impactSummary: bu gelismenin Turkiye lojistik sektorune somut etkisi.',
+              'Hangi tasima modu, hangi rota, hangi maliyet kalemi, hangi tarafi etkiler?',
+              '',
+              `category su degerlerden biri olmali: ${contentCategoryValues.join(', ')}`,
+              'confidence 0 ile 1 arasinda bir sayi olmali; kaynak zayifsa dusuk ver.',
+              '',
+              'facts: kaynaktan cikardigin yapisal veriler (sayilar, tarihler, yer adlari,',
+              'kurum isimleri). Anahtarlari snake_case yaz.',
+              '',
+              'Icerigin dogrulandigini ASLA iddia etme; bunu editor incelemesi icin normallestiriyorsun.',
+            ].join('\n'),
           },
           {
             role: 'user',
@@ -147,7 +179,7 @@ export class ModelRouter {
 
     return {
       title: parsed.title?.trim() || rawItem.title,
-      summary: parsed.summary?.trim() || rawItem.rawText.trim().slice(0, 280) || rawItem.title,
+      summary: parsed.summary?.trim() || rawItem.rawText.trim().slice(0, 1500) || rawItem.title,
       impactSummary: parsed.impactSummary?.trim() || 'Editoryal degerlendirme gerekir.',
       category: sanitizeCategory(parsed.category ?? 'other'),
       confidence: typeof parsed.confidence === 'number' ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5,

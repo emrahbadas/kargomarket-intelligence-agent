@@ -6,6 +6,7 @@ import { IngestionOrchestrator } from '../services/ingestionOrchestrator.js';
 import { PipelineService } from '../services/pipeline.js';
 import { TelegramReader } from '../services/telegramReader.js';
 import { searchYouTubeByKeywords } from '../services/youtubeSearch.js';
+import { NewsSearchService } from '../services/newsSearch.js';
 
 const manualIngestSchema = z.object({
   sourceName: z.string().min(2),
@@ -88,6 +89,12 @@ const youtubeSearchSchema = z.object({
   channelFilters: z.array(z.string().min(1)).max(12).optional(),
   limit: z.number().int().positive().max(30).optional(),
   publishedAfterHours: z.number().int().positive().max(24 * 180).optional(),
+});
+
+const newsSearchSchema = z.object({
+  keywords: z.array(z.string().min(2)).max(12).optional(),
+  limit: z.number().int().positive().max(20).optional(),
+  recencyHours: z.number().int().positive().max(24 * 14).optional(),
 });
 
 const toErrorMessage = (error: unknown) => {
@@ -241,6 +248,44 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
 
     try {
       const result = await searchYouTubeByKeywords(parsedBody.data);
+      return { status: 'ok', data: result };
+    } catch (error) {
+      return reply.code(500).send({ status: 'error', error: toErrorMessage(error) });
+    }
+  });
+
+  /**
+   * Acik haber kaynaklarindan tarama.
+   *
+   * YouTube taramasiyla ayni deseni izler: yalnizca SONUC dondurur, kuyruga
+   * kendisi yazmaz. Editor tezgahta hangi haberleri alacagina karar verip
+   * /v1/ingest/manual ile gonderir. Otomatik kuyruga yazmak, dogrulanmamis
+   * icerigi editor gormeden sisteme sokardi.
+   */
+  app.post('/v1/news/search', async (request, reply) => {
+    if (!(await ensureWriteAccess(request, reply))) {
+      return reply;
+    }
+
+    const parsedBody = newsSearchSchema.safeParse(request.body || {});
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        error: 'Invalid payload',
+        details: parsedBody.error.flatten(),
+      });
+    }
+
+    const service = new NewsSearchService();
+    if (!service.isConfigured()) {
+      return reply.code(503).send({
+        status: 'error',
+        error: 'PERPLEXITY_API_KEY tanimli degil.',
+        hint: 'Ajanin .env dosyasina PERPLEXITY_API_KEY ekleyin.',
+      });
+    }
+
+    try {
+      const result = await service.search(parsedBody.data);
       return { status: 'ok', data: result };
     } catch (error) {
       return reply.code(500).send({ status: 'error', error: toErrorMessage(error) });

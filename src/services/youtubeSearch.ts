@@ -8,8 +8,10 @@ const DEFAULT_LIMIT = 12;
 const MAX_LIMIT = 30;
 const DEFAULT_PUBLISHED_AFTER_HOURS = 24 * 30;
 const MAX_CHANNEL_FILTERS = 12;
-const MAX_TRANSCRIPT_WINDOW_MS = 3 * 60 * 1000;
-const MAX_TRANSCRIPT_CHARS = 2200;
+// Transkript butcesi. Onceki deger 2200 idi ve ayrica yalnizca ilk 3
+// dakika okunuyordu; 20 dakikalik bir analizden modele yalnizca selamlama
+// ulasiyordu. 12000 karakter ~3000 token; gpt-4.1-mini icin rahat bir girdi.
+const MAX_TRANSCRIPT_CHARS = 12000;
 
 interface YouTubeSearchApiItem {
   id?: {
@@ -81,6 +83,8 @@ export interface YouTubeSearchItem {
   transcriptExcerpt: string | null;
   transcriptLanguage: string | null;
   transcriptSegmentCount: number;
+  transcriptTotalSegmentCount: number;
+  transcriptSampled: boolean;
   matchedKeywords: string[];
   viewCount: number | null;
   likeCount: number | null;
@@ -99,13 +103,18 @@ export interface YouTubeSearchSummary {
   unresolvedChannels: string[];
 }
 
-interface YouTubeSearchCandidate extends Omit<YouTubeSearchItem, 'rawText' | 'transcriptFetched' | 'transcriptExcerpt' | 'transcriptLanguage' | 'transcriptSegmentCount'> {}
+interface YouTubeSearchCandidate extends Omit<YouTubeSearchItem, 'rawText' | 'transcriptFetched' | 'transcriptExcerpt' | 'transcriptLanguage' | 'transcriptSegmentCount' | 'transcriptTotalSegmentCount' | 'transcriptSampled'> {}
 
 interface TranscriptSnippetResult {
   fetched: boolean;
   excerpt: string | null;
   language: string | null;
+  /** Modele giden segment sayisi. */
   segmentCount: number;
+  /** Transkriptteki toplam anlamli segment sayisi (ornekleme oncesi). */
+  totalSegmentCount: number;
+  /** Butce asildigi icin videonun genelinden ornekleme yapildi mi. */
+  sampled: boolean;
 }
 
 const normalizeKeywords = (keywords: string[]) => Array.from(new Set(
@@ -226,9 +235,11 @@ const createRawText = (
     `Video URL: ${item.url}`,
     item.channelUrl ? `Kanal URL: ${item.channelUrl}` : null,
     item.description ? `Aciklama: ${item.description}` : null,
-    item.transcriptExcerpt ? `Transcript ilk 3 dakika ozeti: ${item.transcriptExcerpt}` : null,
+    item.transcriptExcerpt ? `Transcript: ${item.transcriptExcerpt}` : null,
     item.transcriptExcerpt
-      ? 'Not: Transcript kesiti ilk 3 dakikadan temizlenmis, tekrarlar ve dolgu ifadeleri filtrelenmis ham haberlestirme verisidir.'
+      ? (item.transcriptSampled
+        ? `Not: Video uzun oldugu icin transcript videonun TAMAMINA yayilarak orneklendi (${item.transcriptSegmentCount}/${item.transcriptTotalSegmentCount} segment). Giris, gelisme ve sonuc temsil ediliyor; cumleler arasinda atlama olabilir.`
+        : 'Not: Videonun transcriptinin tamami; tekrarlar ve dolgu ifadeleri temizlenmis.')
       : item.transcriptLikelyAvailable
         ? 'Not: Transcript denenedi ama anlamli kesit alinamadi; baslik ve aciklama agirlikli ozet cikar.'
         : 'Not: Bu videoda transcript bilgisi dogrulanamadi; baslik ve aciklama agirlikli ozet cikar.',
@@ -369,6 +380,48 @@ const resolveChannelFilters = async (inputs: string[]) => {
   return { resolved, unresolved };
 };
 
+/**
+ * Butce asildiginda transkripti videonun TAMAMINA yayarak secer.
+ *
+ * Bastan kesmek en kotu secimdir: videonun ilk dakikalari selamlama,
+ * kanal tanitimi ve gundem baslicidir; asil analiz ortada ve sonda gelir.
+ * Onceki surum yalnizca ilk 3 dakikayi okuyordu ve model bu yuzden
+ * "ozetleyecek sey bulamadigi" icin iki cumle yaziyordu.
+ *
+ * Esit araliklarla ornekleme, uzun videolarda da girisin, gelismenin ve
+ * sonucun temsil edilmesini saglar.
+ */
+export const sampleAcrossTranscript = (segments: string[], budget: number): string[] => {
+  const toplam = segments.reduce((acc, s) => acc + s.length + 1, 0);
+  if (toplam <= budget) {
+    return segments;
+  }
+
+  const oran = budget / toplam;
+  const adim = Math.max(1, Math.round(1 / oran));
+  const secilen: string[] = [];
+  let uzunluk = 0;
+
+  for (let i = 0; i < segments.length; i += adim) {
+    const parca = segments[i];
+    if (uzunluk + parca.length + 1 > budget) break;
+    secilen.push(parca);
+    uzunluk += parca.length + 1;
+  }
+
+  // Sonuc bolumu ozellikle degerlidir (cikarim, tahmin, kapanis yorumu);
+  // ornekleme onu atlamis olabilir, son segmentleri geri ekle.
+  for (let i = segments.length - 1; i >= 0 && uzunluk < budget; i -= 1) {
+    const parca = segments[i];
+    if (secilen.includes(parca)) continue;
+    if (uzunluk + parca.length + 1 > budget) break;
+    secilen.push(parca);
+    uzunluk += parca.length + 1;
+  }
+
+  return secilen;
+};
+
 const fetchTranscriptSnippet = async (videoId: string): Promise<TranscriptSnippetResult> => {
   try {
     const rows = await fetchTranscript(videoId);
@@ -376,11 +429,9 @@ const fetchTranscriptSnippet = async (videoId: string): Promise<TranscriptSnippe
     const segments: string[] = [];
     let language: string | null = null;
 
+    // Zaman penceresi kaldirildi: transkriptin TAMAMI okunur. Butce
+    // asilirsa asagida videonun geneline yayilarak ornekleme yapilir.
     for (const row of rows) {
-      if (Number(row.offset) > MAX_TRANSCRIPT_WINDOW_MS) {
-        break;
-      }
-
       const normalized = normalizeTranscriptLine(row.text);
       if (isTranscriptFiller(normalized)) {
         continue;
@@ -396,18 +447,17 @@ const fetchTranscriptSnippet = async (videoId: string): Promise<TranscriptSnippe
       if (!language && row.lang) {
         language = row.lang;
       }
-
-      if (segments.join(' ').length >= MAX_TRANSCRIPT_CHARS) {
-        break;
-      }
     }
 
-    const excerpt = segments.join(' ').trim();
+    const secilen = sampleAcrossTranscript(segments, MAX_TRANSCRIPT_CHARS);
+    const excerpt = secilen.join(' ').trim();
     return {
       fetched: Boolean(excerpt),
       excerpt: excerpt || null,
       language,
-      segmentCount: segments.length,
+      segmentCount: secilen.length,
+      totalSegmentCount: segments.length,
+      sampled: secilen.length < segments.length,
     };
   } catch {
     return {
@@ -415,6 +465,8 @@ const fetchTranscriptSnippet = async (videoId: string): Promise<TranscriptSnippe
       excerpt: null,
       language: null,
       segmentCount: 0,
+      totalSegmentCount: 0,
+      sampled: false,
     };
   }
 };
@@ -530,6 +582,8 @@ export const searchYouTubeByKeywords = async (input: YouTubeSearchInput) => {
       excerpt: null,
       language: null,
       segmentCount: 0,
+      totalSegmentCount: 0,
+      sampled: false,
     } satisfies TranscriptSnippetResult;
 
     const enrichedItem = {
@@ -538,6 +592,8 @@ export const searchYouTubeByKeywords = async (input: YouTubeSearchInput) => {
       transcriptExcerpt: transcript.excerpt,
       transcriptLanguage: transcript.language,
       transcriptSegmentCount: transcript.segmentCount,
+      transcriptTotalSegmentCount: transcript.totalSegmentCount,
+      transcriptSampled: transcript.sampled,
     } satisfies Omit<YouTubeSearchItem, 'rawText'>;
 
     return {
