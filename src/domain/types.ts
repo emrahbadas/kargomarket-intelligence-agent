@@ -62,6 +62,15 @@ export interface ParsedSignal {
   category: ContentCategory;
   title: string;
   summary: string;
+  /**
+   * Uzun govde metni - detay gorunumu icin.
+   *
+   * summary karta sigacak kisa metindir; body ise kaynaktan cikarilan
+   * ayrintili anlatimdir. Ikisini ayirmanin sebebi: tek bir alan hem kart
+   * hem detay icin kullanilinca ya kart tasiyor ya detay yalin kaliyordu.
+   * Kaynak zayifsa null kalabilir - uydurarak doldurulmaz.
+   */
+  body: string | null;
   impactSummary: string;
   confidence: number;
   facts: Record<string, string | number | boolean | null>;
@@ -76,6 +85,7 @@ export interface ReviewQueueItem {
   publishTarget: PublishTarget;
   title: string;
   summary: string;
+  body?: string | null;
   impactSummary: string;
   category: ContentCategory;
   confidence: number;
@@ -94,6 +104,7 @@ export interface PublishedContentItem {
   publishTarget: PublishTarget;
   title: string;
   summary: string;
+  body?: string | null;
   impactSummary: string;
   category: ContentCategory;
   confidence: number;

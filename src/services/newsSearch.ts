@@ -1,4 +1,6 @@
 import { env, type AppEnv } from '../config/env.js';
+import { extractArticles, type ExtractedArticle } from './articleExtractor.js';
+import { truncateAtSentence } from './textBudget.js';
 
 /**
  * Acik haber kaynaklarindan lojistik haberi toplar.
@@ -22,6 +24,15 @@ import { env, type AppEnv } from '../config/env.js';
 const SONAR_TIMEOUT_MS = 45_000;
 const DEFAULT_LIMIT = 8;
 const MAX_LIMIT = 20;
+/**
+ * Tek bir makaleden havuza girecek en fazla karakter.
+ *
+ * Onceki surumde havuza yalnizca arama modelinin ~1000 karakterlik ozeti
+ * giriyordu. 6000 karakter, uzun analiz yazilarinin buyuk kismini alir ve
+ * modelin UYDURMADAN yazabilmesi icin gereken malzemeyi fazlasiyla verir.
+ * Kirpma cumle sinirinda yapilir.
+ */
+const MAX_ARTICLE_CHARS = 6000;
 
 export interface NewsSearchInput {
   /** Aranacak konu basliklari. Bos birakilirsa varsayilan lojistik gundemi kullanilir. */
@@ -47,6 +58,16 @@ export interface NewsSearchItem {
   citations: NewsCitation[];
   /** Pipeline'a verilecek ham metin. */
   rawText: string;
+  /**
+   * Kaynak sayfadan gercek makale metni cekilebildi mi.
+   * false ise havuzda yalnizca arama modelinin ozeti var - bu durumda
+   * ozetleyici modelin elinde daha az malzeme olur.
+   */
+  articleFetched: boolean;
+  /** Cekilen makale metninin karakter sayisi. */
+  articleCharCount: number;
+  /** Cekilemediyse sebebi (bot engeli, cerez duvari, zaman asimi...). */
+  articleFailureReason: string | null;
 }
 
 export interface NewsSearchResult {
@@ -57,6 +78,10 @@ export interface NewsSearchResult {
   /** Modelin verdigi ama atif listesinde bulunmayan, bu yuzden atilan adresler. */
   rejectedUrls: string[];
   model: string;
+  /** Kac haberin tam metni cekilebildi. */
+  articlesFetched: number;
+  /** Cekilen tum makalelerin toplam karakteri - havuzun gercek buyuklugu. */
+  totalArticleChars: number;
 }
 
 const DEFAULT_KEYWORDS = [
@@ -226,12 +251,12 @@ export class NewsSearchService {
     };
 
     const rejectedUrls: string[] = [];
-    const items: NewsSearchItem[] = [];
 
-    for (const row of parsed.items ?? []) {
+    // Once atfi dogrulanan haberleri ayikla.
+    const dogrulanan = (parsed.items ?? []).flatMap((row) => {
       const title = String(row.title || '').trim();
       const summary = String(row.summary || '').trim();
-      if (!title || !summary) continue;
+      if (!title || !summary) return [];
 
       const iddiaEdilen = normalizeUrl(row.sourceUrl);
 
@@ -239,35 +264,74 @@ export class NewsSearchService {
       // kullandigi kaynaklar arasinda mi? Degilse uydurulmus kabul edilir.
       if (!iddiaEdilen || !izinliUrlSet.has(iddiaEdilen)) {
         if (row.sourceUrl) rejectedUrls.push(String(row.sourceUrl));
-        continue;
+        return [];
       }
 
       const eslesen = allCitations.find((item) => item.url === iddiaEdilen)!;
-      const publishedAt = row.publishedAt || eslesen.publishedAt || null;
-
-      items.push({
+      return [{
         title,
         summary,
-        sourceName: hostOf(iddiaEdilen),
-        sourceUrl: iddiaEdilen,
-        publishedAt,
-        citations: [eslesen],
+        url: iddiaEdilen,
+        citation: eslesen,
+        publishedAt: row.publishedAt || eslesen.publishedAt || null,
+      }];
+    });
+
+    // HAVUZUN ASIL DOLDUGU YER BURASI.
+    // Arama modelinin ozeti havuz icin yeterli degildi: elde az malzeme
+    // olunca ozetleyici model bosluklari kendi bilgisiyle doldurur ve
+    // uydurma riski artar. Dogrulanan her adresin sayfasi indirilip tam
+    // makale metni cikariliyor; modele giden sey artik ozetin ozeti degil,
+    // haberin kendisi.
+    const makaleler = await extractArticles(dogrulanan.map((item) => item.url));
+
+    const items: NewsSearchItem[] = dogrulanan.map((item) => {
+      const makale: ExtractedArticle | undefined = makaleler.get(item.url);
+      const tamMetin = makale && !makale.failureReason ? makale.text : null;
+
+      // Butce CUMLE SINIRINDA uygulanir; ortadan bolunen cumle hem
+      // okunamaz hem de modele yarim baglam verir ve model onu kendi
+      // tahminiyle tamamlar.
+      const govde = tamMetin
+        ? truncateAtSentence(tamMetin, { budget: MAX_ARTICLE_CHARS })
+        : null;
+
+      return {
+        title: item.title,
+        summary: item.summary,
+        sourceName: hostOf(item.url),
+        sourceUrl: item.url,
+        publishedAt: item.publishedAt,
+        citations: [item.citation],
+        articleFetched: Boolean(govde),
+        articleCharCount: govde?.length ?? 0,
+        articleFailureReason: makale?.failureReason ?? 'Cikarim denenmedi',
         rawText: [
           'Acik haber kaynagi taramasi',
           `Aranan konular: ${query}`,
-          `Haber basligi: ${title}`,
-          `Kaynak: ${hostOf(iddiaEdilen)}`,
-          `Kaynak adresi: ${iddiaEdilen}`,
-          publishedAt ? `Yayin tarihi: ${publishedAt}` : null,
+          `Haber basligi: ${item.title}`,
+          `Kaynak: ${hostOf(item.url)}`,
+          `Kaynak adresi: ${item.url}`,
+          item.publishedAt ? `Yayin tarihi: ${item.publishedAt}` : null,
+          makale?.byline ? `Yazar: ${makale.byline}` : null,
           '',
-          summary,
+          govde
+            ? '--- KAYNAK SAYFADAN CEKILEN TAM MAKALE METNI ---'
+            : '--- ARAMA MODELI OZETI (tam metin cekilemedi) ---',
+          govde || item.summary,
           '',
-          `Not: Bu icerik web aramasiyla toplandi ve kaynak adresi API'nin dondurdugu`,
-          'atif listesiyle dogrulandi. Dogrulugu editor tarafindan teyit edilmelidir.',
+          govde
+            ? `Not: Yukaridaki metin kaynak sayfadan dogrudan cekildi (${govde.length} karakter). Ozeti BU METINDEN cikar, disaridan bilgi ekleme.`
+            : `Not: Kaynak sayfanin tam metni cekilemedi (${makale?.failureReason || 'bilinmeyen sebep'}). Elde yalnizca arama modelinin ozeti var; eksik ayrintilari TAHMIN ETME, ozet kisa kalabilir.`,
+          "Kaynak adresi API'nin dondurdugu atif listesiyle dogrulandi.",
+          'Dogrulugu editor tarafindan teyit edilmelidir.',
         ].filter((line): line is string => line !== null).join('\n'),
-      });
-    }
+      };
+    });
 
-    return { query, items, allCitations, rejectedUrls, model };
+    const articlesFetched = items.filter((item) => item.articleFetched).length;
+    const totalArticleChars = items.reduce((acc, item) => acc + item.articleCharCount, 0);
+
+    return { query, items, allCitations, rejectedUrls, model, articlesFetched, totalArticleChars };
   }
 }

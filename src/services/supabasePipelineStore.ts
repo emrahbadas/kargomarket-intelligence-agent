@@ -7,6 +7,7 @@ interface ParsedSignalRow {
   category: string;
   title: string;
   summary: string;
+  body?: string | null;
   impact_summary: string;
   confidence: number;
   facts: Record<string, string | number | boolean | null>;
@@ -21,6 +22,7 @@ interface ReviewQueueRow {
   publish_target: 'sector-news' | 'market-signal';
   title: string;
   summary: string;
+  body?: string | null;
   impact_summary: string;
   category: string;
   confidence: number;
@@ -39,6 +41,7 @@ interface PublishedContentRow {
   publish_target: PublishTarget;
   title: string;
   summary: string;
+  body?: string | null;
   impact_summary: string;
   category: string;
   confidence: number;
@@ -86,6 +89,7 @@ const mapParsedRow = (row: ParsedSignalRow): ParsedSignal => ({
   category: row.category as ParsedSignal['category'],
   title: row.title,
   summary: row.summary,
+  body: row.body ?? null,
   impactSummary: row.impact_summary,
   confidence: Number(row.confidence || 0),
   facts: row.facts || {},
@@ -181,6 +185,7 @@ export class SupabasePipelineStore {
         category: item.category,
         title: item.title,
         summary: item.summary,
+        body: item.body ?? null,
         impact_summary: item.impactSummary,
         confidence: item.confidence,
         facts: item.facts,
@@ -209,6 +214,7 @@ export class SupabasePipelineStore {
         publish_target: item.publishTarget,
         title: item.title,
         summary: item.summary,
+        body: item.body ?? null,
         impact_summary: item.impactSummary,
         category: item.category,
         confidence: item.confidence,
@@ -321,6 +327,7 @@ export class SupabasePipelineStore {
         publish_target: item.publishTarget,
         title: item.title,
         summary: item.summary,
+        body: item.body ?? null,
         impact_summary: item.impactSummary,
         category: item.category,
         confidence: item.confidence,
