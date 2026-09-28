@@ -277,15 +277,28 @@ export class NewsSearchService {
       }];
     });
 
+    // AYNI ADRESI BIR KEZ AL.
+    // Birden fazla anahtar kelime verildiginde Sonar ayni makaleyi farkli
+    // basliklarla birden cok kez dondurebiliyor (uretimde gozlendi: ayni
+    // rayhaber.com yazisi iki ayri baslikla geldi). Tekilleştirmezsek
+    // havuz sisik gorunur, editor ayni haberi iki kez degerlendirir ve
+    // ayni sayfayi bosuna iki kez indiririz.
+    const gorulen = new Set<string>();
+    const benzersiz = dogrulanan.filter((item) => {
+      if (gorulen.has(item.url)) return false;
+      gorulen.add(item.url);
+      return true;
+    });
+
     // HAVUZUN ASIL DOLDUGU YER BURASI.
     // Arama modelinin ozeti havuz icin yeterli degildi: elde az malzeme
     // olunca ozetleyici model bosluklari kendi bilgisiyle doldurur ve
     // uydurma riski artar. Dogrulanan her adresin sayfasi indirilip tam
     // makale metni cikariliyor; modele giden sey artik ozetin ozeti degil,
     // haberin kendisi.
-    const makaleler = await extractArticles(dogrulanan.map((item) => item.url));
+    const makaleler = await extractArticles(benzersiz.map((item) => item.url));
 
-    const items: NewsSearchItem[] = dogrulanan.map((item) => {
+    const items: NewsSearchItem[] = benzersiz.map((item) => {
       const makale: ExtractedArticle | undefined = makaleler.get(item.url);
       const tamMetin = makale && !makale.failureReason ? makale.text : null;
 
