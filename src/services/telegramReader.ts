@@ -114,6 +114,10 @@ const uniqueStrings = (items: string[]) => {
   return [...new Set(items.map((item) => String(item || '').trim()).filter(Boolean))];
 };
 
+const isTransientTelegramNetworkError = (message: string) => {
+  return /(TIMEOUT|TIMEDOUT|ETIMEDOUT|ECONNRESET|CONNECTION|socket|NETWORK)/i.test(message);
+};
+
 const TELEGRAM_SESSION_CONFIG_KEY = 'telegram_session_string';
 
 const maskSessionString = (value: string) => {
@@ -520,6 +524,13 @@ export class TelegramReader {
 
       if (!this.connected) {
         await this.client.connect();
+
+        const isAuthorized = await this.client.checkAuthorization();
+        if (!isAuthorized) {
+          await this.invalidateSession('Telegram session gecersiz. OTP ile yeniden giris yapin.');
+          throw new Error(this.lastAuthError || 'Telegram oturumu yetkili degil.');
+        }
+
         this.connected = true;
         this.lastAuthError = null;
       }
@@ -781,29 +792,51 @@ export class TelegramReader {
   }
 
   async getJoinedChannels(limit = 200) {
-    await this.connect();
-
-    if (!this.client) {
-      throw new Error('Telegram client olusturulamadi.');
-    }
-
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 500));
     let dialogs;
-    try {
-      dialogs = await this.client.getDialogs({
-        limit: Math.max(1, Math.min(Number(limit) || 200, 500)),
+
+    const readDialogs = async () => {
+      await this.connect();
+
+      if (!this.client) {
+        throw new Error('Telegram client olusturulamadi.');
+      }
+
+      return this.client.getDialogs({
+        limit: safeLimit,
       });
+    };
+
+    try {
+      dialogs = await readDialogs();
       this.lastAuthError = null;
       this.setLiveCheck('ok', `${dialogs.length} kanal listesi alindi.`, dialogs.length);
     } catch (error) {
-      const message = formatError(error);
-      if (this.isSessionRevokedError(message)) {
+      const firstMessage = formatError(error);
+
+      if (this.isSessionRevokedError(firstMessage)) {
         await this.invalidateSession('Telegram session gecersiz veya revoke edildi. Yeniden OTP ile giris yapin.');
-      } else {
-        this.lastAuthError = message;
-        this.setLiveCheck('failed', message, 0);
+        throw new Error(this.lastAuthError || firstMessage);
       }
 
-      throw new Error(this.lastAuthError || message);
+      // Telegram transport occasionally drops updates loop with TIMEOUT; retry once on a fresh client.
+      if (isTransientTelegramNetworkError(firstMessage)) {
+        this.resetClient();
+        try {
+          dialogs = await readDialogs();
+          this.lastAuthError = null;
+          this.setLiveCheck('ok', `${dialogs.length} kanal listesi alindi.`, dialogs.length);
+        } catch (retryError) {
+          const retryMessage = formatError(retryError);
+          this.lastAuthError = retryMessage;
+          this.setLiveCheck('failed', retryMessage, 0);
+          throw new Error(retryMessage);
+        }
+      } else {
+        this.lastAuthError = firstMessage;
+        this.setLiveCheck('failed', firstMessage, 0);
+        throw new Error(firstMessage);
+      }
     }
 
     const channels = dialogs
