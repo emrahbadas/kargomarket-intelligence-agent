@@ -32,6 +32,8 @@ interface ScannedChannelMessage {
   channel: string;
   channelId: string;
   channelRef: string;
+  /** Ayni metin taramada kac kez gecti (1'den buyukse digerleri ayiklandi). */
+  repeatCount?: number;
 }
 
 interface ReaderStatus {
@@ -112,6 +114,30 @@ const formatError = (error: unknown) => {
 
 const uniqueStrings = (items: string[]) => {
   return [...new Set(items.map((item) => String(item || '').trim()).filter(Boolean))];
+};
+
+// Ayni ilan saniyeler arayla tekrar atilabiliyor; bosluk, gorunmez karakter ve
+// buyuk/kucuk harf farki gozetmeden metni karsilastirma anahtarina cevirir.
+// Veritabanindaki public.content_fingerprint ile ayni kurali izler.
+const toDedupeKey = (text: string) =>
+  text.replace(/[\s\u00a0\u200b-\u200d\u2060\ufeff\ufe0f]+/g, '').toLowerCase();
+
+const collapseRepeatedMessages = (items: ScannedChannelMessage[]) => {
+  const byKey = new Map<string, ScannedChannelMessage>();
+
+  // Liste en yeni mesaj basta olacak sekilde sirali; en yenisi kalir.
+  for (const item of items) {
+    const key = toDedupeKey(item.text);
+    const kept = byKey.get(key);
+    if (kept) {
+      kept.repeatCount = (kept.repeatCount || 1) + 1;
+      continue;
+    }
+
+    byKey.set(key, item);
+  }
+
+  return Array.from(byKey.values());
 };
 
 const isTransientTelegramNetworkError = (message: string) => {
@@ -999,7 +1025,9 @@ export class TelegramReader {
       }
     }
 
-    return results.sort((left, right) => String(right.date || '').localeCompare(String(left.date || '')));
+    return collapseRepeatedMessages(
+      results.sort((left, right) => String(right.date || '').localeCompare(String(left.date || ''))),
+    );
   }
 
   async searchChannels(channelRefs: string[], keywords: string[], limit = 10) {

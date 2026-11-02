@@ -585,6 +585,7 @@ export const registerRoutes = async (app: FastifyInstance, pipeline: PipelineSer
             hoursBack: parsedBody.data.hoursBack,
             channelCount: parsedBody.data.channelRefs.length,
             itemCount: items.length,
+            duplicateCount: items.reduce((total, item) => total + Math.max(0, (item.repeatCount || 1) - 1), 0),
             limitPerChannel: parsedBody.data.limitPerChannel || 80,
           },
         },
